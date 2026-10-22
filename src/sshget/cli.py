@@ -1,4 +1,4 @@
-"""Command-line entry point for sshget."""
+"""Command-line entry points for sshget and shared flags."""
 
 from __future__ import annotations
 
@@ -10,9 +10,51 @@ from sshget import __version__
 from sshget.browser import run_browser
 from sshget.connect import open_connection
 from sshget.errors import SSHGetError
-from sshget.hosts import Target, parse_target, resolve_host
+from sshget.hosts import host_only, parse_target, resolve_host
 from sshget.paths import expand_remote_path
 from sshget.transfer import ExistingHandler, download_paths
+
+
+def add_common_flags(parser: argparse.ArgumentParser, *, existing_noun: str) -> None:
+    """Flags shared by sshget and sshput."""
+    parser.add_argument(
+        "-i",
+        "--identity",
+        metavar="PATH",
+        help="SSH private key file, like ssh -i (for example a .pem)",
+    )
+    parser.add_argument(
+        "--existing",
+        choices=("ask", "skip", "overwrite"),
+        default="ask",
+        help=f"What to do when a {existing_noun} already exists (default: ask)",
+    )
+    parser.add_argument(
+        "-y",
+        "--overwrite",
+        action="store_true",
+        help=f"Overwrite existing {existing_noun}s (same as --existing overwrite)",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help=f"Skip existing {existing_noun}s (same as --existing skip)",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"{parser.prog} {__version__}",
+    )
+
+
+def existing_mode(args: argparse.Namespace) -> str:
+    if args.overwrite and args.skip_existing:
+        raise SSHGetError("use only one of --overwrite / --skip-existing")
+    if args.overwrite:
+        return "overwrite"
+    if args.skip_existing:
+        return "skip"
+    return args.existing
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
             "examples:\n"
             "  sshget myserver\n"
             "  sshget user@host:2222\n"
-            "  sshget myserver:/var/log/syslog\n"
+            "  sshget -i key.pem myserver:/var/log/syslog\n"
             "  sshget myserver:/var/www ./backup\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -42,46 +84,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=".",
         help="Local destination (default: current directory)",
     )
-    parser.add_argument(
-        "--existing",
-        choices=("ask", "skip", "overwrite"),
-        default="ask",
-        help="What to do when a local file already exists (default: ask)",
-    )
-    parser.add_argument(
-        "-y",
-        "--overwrite",
-        action="store_true",
-        help="Overwrite existing local files (same as --existing overwrite)",
-    )
-    parser.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Skip existing local files (same as --existing skip)",
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"sshget {__version__}",
-    )
+    add_common_flags(parser, existing_noun="local file")
     return parser
-
-
-def _existing_mode(args: argparse.Namespace) -> str:
-    if args.overwrite and args.skip_existing:
-        raise SSHGetError("use only one of --overwrite / --skip-existing")
-    if args.overwrite:
-        return "overwrite"
-    if args.skip_existing:
-        return "skip"
-    return args.existing
 
 
 def run(args: argparse.Namespace) -> int:
     target = parse_target(args.target)
     dest = Path(args.local_dest)
-    existing = _existing_mode(args)
-    host = resolve_host(target if target.remote_path is None else _host_only(target))
+    existing = existing_mode(args)
+    host = resolve_host(
+        target if target.remote_path is None else host_only(target),
+        identity=args.identity,
+    )
 
     with open_connection(host) as conn:
         if target.remote_path is None:
@@ -100,21 +114,21 @@ def run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _host_only(target: Target) -> Target:
-    return Target(host=target.host, user=target.user, port=target.port)
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def run_safely(fn, argv: list[str] | None = None) -> int:
     try:
-        return run(args)
+        return fn(argv)
     except KeyboardInterrupt:
         sys.stderr.write("\nAborted.\n")
         return 130
     except SSHGetError as exc:
         sys.stderr.write(f"error: {exc}\n")
         return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return run_safely(lambda _: run(args), argv)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 from sshget.browser import BrowserState, DirEntry, apply_key, paths_to_download, render_state
-from sshget.term import BACKSPACE, ENTER, SPACE, UP
+from sshget.term import BACKSPACE, CTRL_G, ENTER, SPACE, UP
 
 
 def _state(**kwargs) -> BrowserState:
@@ -69,6 +69,18 @@ def test_arrows_move_cursor():
     assert state.cursor == 0
 
 
+def test_put_mode_u_uploads_here_and_enter_opens_dirs():
+    state = _state(mode="put", cursor=1)
+    assert apply_key(state, "u") == "put"
+    assert apply_key(state, CTRL_G) == "put"
+    assert apply_key(state, ENTER) == "open"
+    state = _state(mode="put", cursor=2)
+    assert apply_key(state, ENTER) == "none"
+    assert apply_key(state, SPACE) == "none"
+    assert apply_key(state, "d") == "none"
+    assert state.filter == "d"
+
+
 def test_render_includes_sizes_and_types():
     from rich.console import Console
 
@@ -82,3 +94,15 @@ def test_render_includes_sizes_and_types():
     assert "dir" in text
     assert "file" in text
     assert "filter:" in text
+
+
+def test_render_put_mode_title():
+    from rich.console import Console
+
+    state = _state(mode="put")
+    console = Console(record=True, width=88, force_terminal=True, color_system=None)
+    console.print(render_state(state, height=20, width=88))
+    text = console.export_text()
+    assert "sshput" in text
+    assert "pick dest folder" in text
+    assert "u=upload here" in text

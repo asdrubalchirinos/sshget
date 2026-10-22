@@ -21,7 +21,7 @@ from rich.progress import (
 )
 
 from sshget.errors import SSHGetError
-from sshget.paths import local_target, remote_basename, safe_local_child
+from sshget.paths import local_target, parent_path, remote_basename, remote_join, safe_local_child
 
 ExistingMode = str  # ask | skip | overwrite
 AskFn = Callable[[str], str]
@@ -52,6 +52,47 @@ def is_directory(sftp: paramiko.SFTPClient, path: str, attr: paramiko.SFTPAttrib
     return bool(followed.st_mode and stat.S_ISDIR(followed.st_mode))
 
 
+def remote_exists(sftp: paramiko.SFTPClient, path: str) -> bool:
+    try:
+        sftp.stat(path)
+        return True
+    except OSError:
+        return False
+
+
+def remote_makedirs(sftp: paramiko.SFTPClient, path: str) -> None:
+    """Create a remote directory and any missing parents (like `mkdir -p`)."""
+    path = path.rstrip("/") or "/"
+    if path == "/":
+        return
+    try:
+        attr = sftp.stat(path)
+        if not is_directory(sftp, path, attr):
+            raise SSHGetError(f"remote path is not a directory: {path}")
+        return
+    except OSError:
+        pass
+    parent = parent_path(path)
+    if parent != path:
+        remote_makedirs(sftp, parent)
+    try:
+        sftp.mkdir(path)
+    except OSError as exc:
+        if is_directory(sftp, path):
+            return
+        raise SSHGetError(f"cannot create remote directory {path}: {exc}") from exc
+
+
+def _progress() -> Progress:
+    return Progress(
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+    )
+
+
 @dataclass
 class PlannedFile:
     remote: str
@@ -67,15 +108,17 @@ class ExistingHandler:
     ask_fn: AskFn = input
     _always: str | None = None  # overwrite | skip, after "all" / "none"
 
-    def should_write(self, local_path: Path) -> bool:
-        if not local_path.exists():
+    def should_write(self, path: Path | str, exists: bool | None = None) -> bool:
+        if exists is None:
+            exists = Path(path).exists()
+        if not exists:
             return True
         if self._always == "overwrite" or self.mode == "overwrite":
             return True
         if self._always == "skip" or self.mode == "skip":
             return False
         prompt = (
-            f"{local_path} already exists. "
+            f"{path} already exists. "
             "[o]verwrite / [s]kip / [a]ll overwrite / [n]one skip / [q]uit: "
         )
         while True:
@@ -91,7 +134,7 @@ class ExistingHandler:
                 self._always = "skip"
                 return False
             if answer in {"q", "quit"}:
-                raise SSHGetError("download cancelled")
+                raise SSHGetError("cancelled")
             sys.stderr.write("Please answer o, s, a, n, or q.\n")
 
 
@@ -171,13 +214,7 @@ def download_paths(
 
     total = sum(item.size for item in planned)
     written = 0
-    with Progress(
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(),
-        DownloadColumn(),
-        TransferSpeedColumn(),
-        TimeRemainingColumn(),
-    ) as progress:
+    with _progress() as progress:
         overall = progress.add_task("total", total=max(total, 1))
         file_task = progress.add_task("file", total=1)
 
@@ -214,3 +251,147 @@ def _get_file(
         sftp.get(item.remote, str(item.local), callback=callback)
     except OSError as exc:
         raise SSHGetError(f"failed to download {item.remote}: {exc}") from exc
+
+
+def plan_upload(
+    local_path: Path,
+    remote_dest: str,
+    *,
+    into_dir: bool,
+) -> tuple[list[str], list[PlannedFile]]:
+    """
+    Map a local file or folder onto remote paths.
+
+    If `into_dir`, the item is placed under `remote_dest` using its basename
+    (scp into a directory). Otherwise `remote_dest` is the exact remote path.
+    """
+    local_path = local_path.expanduser().resolve()
+    if not local_path.exists():
+        raise SSHGetError(f"local path not found: {local_path}")
+    if into_dir:
+        remote_root = remote_join(remote_dest.rstrip("/") or "/", local_path.name)
+    else:
+        remote_root = remote_dest.rstrip("/") or local_path.name
+
+    dirs: list[str] = []
+    files: list[PlannedFile] = []
+    if local_path.is_dir():
+        _walk_local(local_path, remote_root, dirs, files)
+    elif local_path.is_file():
+        files.append(PlannedFile(remote_root, local_path, local_path.stat().st_size))
+    else:
+        raise SSHGetError(f"not a regular file or directory: {local_path}")
+    return dirs, files
+
+
+def _walk_local(
+    local_dir: Path,
+    remote_dir: str,
+    dirs: list[str],
+    files: list[PlannedFile],
+) -> None:
+    dirs.append(remote_dir)
+    for entry in sorted(local_dir.iterdir(), key=lambda item: item.name.lower()):
+        if entry.is_dir() and not entry.is_symlink():
+            _walk_local(entry, remote_join(remote_dir, entry.name), dirs, files)
+        elif entry.is_file():
+            files.append(
+                PlannedFile(
+                    remote_join(remote_dir, entry.name),
+                    entry,
+                    entry.stat().st_size,
+                )
+            )
+
+
+def infer_into_dir(
+    sftp: paramiko.SFTPClient,
+    remote_raw: str,
+    sources: list[Path],
+) -> bool:
+    """Whether uploads go *inside* `remote_raw` (scp directory destination)."""
+    if len(sources) > 1 or remote_raw.endswith("/"):
+        return True
+    remote = remote_raw.rstrip("/") or "/"
+    try:
+        attr = sftp.stat(remote)
+    except OSError:
+        return False
+    return is_directory(sftp, remote, attr)
+
+
+def upload_paths(
+    sftp: paramiko.SFTPClient,
+    local_paths: Iterable[Path | str],
+    remote_dest: str,
+    existing: ExistingHandler | str = "ask",
+    *,
+    into_dir: bool | None = None,
+) -> list[str]:
+    """Upload local files/folders to `remote_dest`. Returns remote roots written."""
+    handler = existing if isinstance(existing, ExistingHandler) else ExistingHandler(existing)
+    sources = [Path(path) for path in local_paths]
+    if not sources:
+        raise SSHGetError("need at least one local path to upload")
+    if into_dir is None:
+        into_dir = infer_into_dir(sftp, remote_dest, sources)
+    remote_dest = remote_dest.rstrip("/") or "/"
+
+    planned: list[PlannedFile] = []
+    dirs: list[str] = []
+    roots: list[str] = []
+    for source in sources:
+        item_dirs, files = plan_upload(source, remote_dest, into_dir=into_dir)
+        if into_dir:
+            roots.append(remote_join(remote_dest, source.expanduser().resolve().name))
+        else:
+            roots.append(remote_dest)
+        dirs.extend(item_dirs)
+        planned.extend(files)
+
+    if into_dir:
+        remote_makedirs(sftp, remote_dest)
+    for directory in dirs:
+        remote_makedirs(sftp, directory)
+
+    if not planned:
+        return roots
+
+    total = sum(item.size for item in planned)
+    written = 0
+    with _progress() as progress:
+        overall = progress.add_task("total", total=max(total, 1))
+        file_task = progress.add_task("file", total=1)
+        for item in planned:
+            exists = remote_exists(sftp, item.remote)
+            if not handler.should_write(item.remote, exists=exists):
+                progress.console.print(f"skip {item.remote}")
+                written += item.size
+                progress.update(overall, completed=min(written, total))
+                continue
+            remote_makedirs(sftp, parent_path(item.remote))
+            _put_file(sftp, item, progress, file_task, overall, written)
+            written += item.size
+            progress.update(overall, completed=min(written, max(total, 1)))
+    return roots
+
+
+def _put_file(
+    sftp: paramiko.SFTPClient,
+    item: PlannedFile,
+    progress: Progress,
+    file_task: TaskID,
+    overall: TaskID,
+    written_before: int,
+) -> None:
+    label = item.local.name
+    progress.update(file_task, description=label, completed=0, total=max(item.size, 1))
+
+    def callback(transferred: int, total: int) -> None:
+        progress.update(file_task, completed=transferred, total=max(total, 1))
+        progress.update(overall, completed=written_before + transferred)
+
+    try:
+        sftp.put(str(item.local), item.remote, callback=callback)
+    except OSError as exc:
+        raise SSHGetError(f"failed to upload {item.local} → {item.remote}: {exc}") from exc

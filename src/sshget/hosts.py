@@ -5,7 +5,7 @@ from __future__ import annotations
 import getpass
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import paramiko
@@ -113,8 +113,68 @@ def load_ssh_config(path: Path | None = None) -> paramiko.SSHConfig:
     return config
 
 
-def resolve_host(target: Target | str, config: paramiko.SSHConfig | None = None) -> ResolvedHost:
-    """Apply `~/.ssh/config` to a target. Explicit user/port on the CLI win."""
+def apply_identity(host: ResolvedHost, identity: str | None) -> ResolvedHost:
+    """Prepend a CLI `-i` key, like `ssh -i`. Missing files are an error."""
+    if not identity:
+        return host
+    path = os.path.expanduser(os.path.expandvars(identity))
+    if not os.path.isfile(path):
+        raise SSHGetError(f"identity file not found: {path}")
+    files = [path] + [existing for existing in host.identity_files if existing != path]
+    return replace(host, identity_files=files)
+
+
+def host_only(target: Target) -> Target:
+    """Drop a remote path so the rest can be resolved as a connection target."""
+    return Target(host=target.host, user=target.user, port=target.port)
+
+
+def parse_put_operands(operands: list[str]) -> tuple[Target, list[Path], bool]:
+    """
+    Split sshput operands into (host, local paths, interactive).
+
+    Interactive: `sshput <host> <local paths...>`
+    Direct: `sshput <local paths...> host:/remote/dir/` (the host:/path
+    token may also be first).
+    """
+    if len(operands) < 2:
+        raise SSHGetError("sshput needs a host and at least one local path")
+
+    parsed: list[Target | None] = []
+    path_indexes: list[int] = []
+    for index, raw in enumerate(operands):
+        try:
+            target = parse_target(raw)
+        except SSHGetError:
+            parsed.append(None)
+            continue
+        parsed.append(target)
+        if target.remote_path is not None:
+            path_indexes.append(index)
+
+    if path_indexes:
+        if len(path_indexes) > 1:
+            raise SSHGetError("only one host:/remote/path destination is allowed")
+        dest_index = path_indexes[0]
+        target = parsed[dest_index]
+        assert target is not None
+        local_raw = [operands[i] for i in range(len(operands)) if i != dest_index]
+        if not local_raw:
+            raise SSHGetError("need at least one local path to upload")
+        return target, [Path(item) for item in local_raw], False
+
+    target = parsed[0]
+    if target is None:
+        raise SSHGetError(f"could not parse host: {operands[0]!r}")
+    return target, [Path(item) for item in operands[1:]], True
+
+
+def resolve_host(
+    target: Target | str,
+    config: paramiko.SSHConfig | None = None,
+    identity: str | None = None,
+) -> ResolvedHost:
+    """Apply `~/.ssh/config` to a target. Explicit user/port/`-i` on the CLI win."""
     if isinstance(target, str):
         target = parse_target(target)
     if target.remote_path:
@@ -147,7 +207,7 @@ def resolve_host(target: Target | str, config: paramiko.SSHConfig | None = None)
     if proxy:
         jumps = [part.strip() for part in proxy.split(",") if part.strip()]
 
-    return ResolvedHost(
+    resolved = ResolvedHost(
         alias=target.host,
         hostname=hostname,
         username=username,
@@ -156,3 +216,4 @@ def resolve_host(target: Target | str, config: paramiko.SSHConfig | None = None)
         identities_only=identities_only,
         proxy_jumps=jumps,
     )
+    return apply_identity(resolved, identity)

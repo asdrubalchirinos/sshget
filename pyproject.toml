@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sshget"
 version = "0.1.0"
-description = "Download files or folders from any SSH server, with an interactive remote browser."
+description = "Download or upload files over SSH/SFTP, with an interactive remote browser."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "asdrubalchirinos" }]
-keywords = ["ssh", "sftp", "scp", "cli"]
+keywords = ["ssh", "sftp", "scp", "cli", "upload", "download"]
 classifiers = [
   "Environment :: Console",
   "Intended Audience :: Developers",
@@ -31,6 +31,7 @@ Repository = "https://github.com/asdrubalchirinos/sshget"
 
 [project.scripts]
 sshget = "sshget.cli:main"
+sshput = "sshget.put:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]

@@ -18,7 +18,7 @@ import pytest
 
 from sshget.connect import open_connection
 from sshget.hosts import load_ssh_config, resolve_host
-from sshget.transfer import ExistingHandler, download_paths
+from sshget.transfer import ExistingHandler, download_paths, upload_paths
 
 SSHD = shutil.which("sshd") or "/usr/sbin/sshd"
 
@@ -267,6 +267,79 @@ def test_browser_starts_on_pty_and_quits(sshd_env, monkeypatch):
                 os.close(fd)
             except OSError:
                 pass
+
+
+PUT_MAIN = "import sys; from sshget.put import main; raise SystemExit(main(sys.argv[1:]))"
+
+
+def test_direct_file_and_folder_upload(sshd_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(sshd_env["home"]))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: sshd_env["home"]))
+    local_dir = tmp_path / "payload"
+    (local_dir / "sub").mkdir(parents=True)
+    (local_dir / "hello.txt").write_text("uploaded hello\n", encoding="utf-8")
+    (local_dir / "sub" / "nested.txt").write_text("uploaded nested\n", encoding="utf-8")
+    remote_dest = sshd_env["remote_root"] / "uploads"
+    config = load_ssh_config(sshd_env["config"])
+    host = resolve_host("testhost", config)
+    with open_connection(host, known_hosts=sshd_env["known_hosts"], config=config) as conn:
+        upload_paths(
+            conn.sftp,
+            [local_dir / "hello.txt", local_dir],
+            str(remote_dest),
+            ExistingHandler("overwrite"),
+            into_dir=True,
+        )
+    assert (remote_dest / "hello.txt").read_text(encoding="utf-8") == "uploaded hello\n"
+    assert (remote_dest / "payload" / "sub" / "nested.txt").read_text(
+        encoding="utf-8"
+    ) == "uploaded nested\n"
+
+
+def test_cli_direct_upload_and_skip_existing(sshd_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(sshd_env["home"]))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: sshd_env["home"]))
+    env = _child_env(sshd_env)
+    remote_dir = sshd_env["remote_root"] / "cli-inbox"
+    remote_dir.mkdir()
+    local = tmp_path / "send.txt"
+    local.write_text("first\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            PUT_MAIN,
+            "-i",
+            str(sshd_env["client_key"]),
+            "-y",
+            str(local),
+            f"testhost:{remote_dir}/",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (remote_dir / "send.txt").read_text(encoding="utf-8") == "first\n"
+
+    local.write_text("second\n", encoding="utf-8")
+    skipped = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            PUT_MAIN,
+            "--skip-existing",
+            str(local),
+            f"testhost:{remote_dir}/",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert skipped.returncode == 0, skipped.stderr
+    assert (remote_dir / "send.txt").read_text(encoding="utf-8") == "first\n"
 
 
 def test_unknown_host_is_rejected_without_tty(sshd_env, tmp_path, monkeypatch):

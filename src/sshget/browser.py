@@ -32,9 +32,11 @@ from sshget.term import (
     UP,
     read_key,
 )
-from sshget.transfer import ExistingHandler, download_paths, format_size, is_directory
+from sshget.transfer import ExistingHandler, download_paths, format_size, is_directory, upload_paths
 
-HELP = "up/down  enter=open  bksp=up  type=filter  space=mark  d=get  q=quit"
+HELP_GET = "up/down  enter=open  bksp=up  type=filter  space=mark  d=get  q=quit"
+HELP_PUT = "up/down  enter=open  bksp=up  type=filter  u=upload here  q=quit"
+HELP = HELP_GET
 
 
 @dataclass
@@ -63,6 +65,7 @@ class BrowserState:
     filter: str = ""
     marked: set[str] = field(default_factory=set)
     status: str = ""
+    mode: str = "get"  # get = download picker, put = destination folder picker
 
     def visible(self) -> list[DirEntry]:
         needle = self.filter.lower()
@@ -130,10 +133,12 @@ def apply_key(state: BrowserState, key: str) -> str:
             return "none"
         return "quit"
     if key in {CTRL_G, CTRL_D}:
-        return "download"
+        return "put" if state.mode == "put" else "download"
     if key == "q" and not state.filter:
         return "quit"
-    if key == "d" and not state.filter:
+    if state.mode == "put" and key == "u" and not state.filter:
+        return "put"
+    if key == "d" and not state.filter and state.mode == "get":
         return "download"
 
     if key == UP:
@@ -163,10 +168,15 @@ def apply_key(state: BrowserState, key: str) -> str:
             return "up"
         if current.is_dir:
             return "open"
+        if state.mode == "put":
+            state.status = "enter opens folders; press u to upload into this directory"
+            return "none"
         # Enter on a file: download that file (quick get).
         state.marked = {current.path}
         return "download"
     if key == SPACE:
+        if state.mode == "put":
+            return "none"
         current = state.current()
         if current is None or current.name == "..":
             return "none"
@@ -248,12 +258,14 @@ def render_state(state: BrowserState, height: int = 20, width: int = 88) -> Rend
             table.add_row(pointer, star, name, entry.kind, size)
 
     title = Text()
-    title.append("sshget", style="bold")
+    title.append("sshput" if state.mode == "put" else "sshget", style="bold")
     title.append("  ")
     title.append(state.host_label, style="cyan")
     title.append("  ")
     title.append(state.remote_cwd, style="green")
-    if state.marked:
+    if state.mode == "put":
+        title.append("   pick dest folder", style="bold cyan")
+    elif state.marked:
         title.append(f"   {len(state.marked)} marked", style="bold cyan")
 
     filter_line = Text("filter: ")
@@ -263,7 +275,8 @@ def render_state(state: BrowserState, height: int = 20, width: int = 88) -> Rend
     else:
         filter_line.append("(type to search)", style="dim")
 
-    footer = Text(state.status or HELP, style="dim")
+    default_help = HELP_PUT if state.mode == "put" else HELP_GET
+    footer = Text(state.status or default_help, style="dim")
     body = Group(filter_line, Text(""), table)
     return Panel(body, title=title, subtitle=footer, subtitle_align="left", width=width)
 
@@ -284,9 +297,12 @@ def _append_highlighted(text: Text, value: str, needle: str, style: str) -> None
 
 def run_browser(
     conn: Connection,
-    dest: Path,
+    dest: Path | None = None,
     existing: str = "ask",
     console: Console | None = None,
+    *,
+    mode: str = "get",
+    local_paths: list[Path] | None = None,
 ) -> int:
     """Run the interactive browser until the user quits. Returns a process exit code."""
     console = console or Console()
@@ -297,10 +313,21 @@ def run_browser(
         cwd = "."
     host = conn.resolved
     label = f"{host.username}@{host.hostname}:{host.port}"
-    state = BrowserState(host_label=label, remote_cwd=cwd, entries=list_entries(sftp, cwd))
-    dest = dest.expanduser().resolve()
-    dest.mkdir(parents=True, exist_ok=True)
+    state = BrowserState(
+        host_label=label,
+        remote_cwd=cwd,
+        entries=list_entries(sftp, cwd),
+        mode=mode,
+    )
     handler = ExistingHandler(existing)
+    if mode == "get":
+        dest = (dest or Path(".")).expanduser().resolve()
+        dest.mkdir(parents=True, exist_ok=True)
+    else:
+        dest = None
+        local_paths = [Path(path).expanduser() for path in (local_paths or [])]
+        if not local_paths:
+            raise SSHGetError("sshput needs at least one local path")
 
     with Live(
         render_state(state, height=console.size.height, width=console.size.width),
@@ -331,13 +358,38 @@ def run_browser(
                 live.stop()
                 try:
                     console.print(f"Downloading {len(paths)} item(s) → {dest}")
-                    download_paths(sftp, paths, dest, handler)
+                    download_paths(sftp, paths, dest or Path("."), handler)
                     console.print("Done. Press any key to continue browsing, or q to quit.")
                     again = read_key()
                     if again in {"q", CTRL_C, CTRL_Q, ESC}:
                         return 0
                     state.status = f"downloaded {len(paths)} item(s) to {dest}"
                     # Keep marks so the user can see what was fetched; cwd listing stays.
+                    state.entries = list_entries(sftp, state.remote_cwd)
+                except SSHGetError as exc:
+                    console.print(f"[red]error:[/red] {exc}")
+                    console.print("Press any key to continue.")
+                    read_key()
+                    state.status = str(exc)
+                finally:
+                    live.start(refresh=True)
+            elif action == "put":
+                live.stop()
+                try:
+                    names = ", ".join(path.name for path in local_paths or [])
+                    console.print(f"Uploading {names} → {state.remote_cwd}")
+                    upload_paths(
+                        sftp,
+                        local_paths or [],
+                        state.remote_cwd,
+                        handler,
+                        into_dir=True,
+                    )
+                    console.print("Done. Press any key to continue browsing, or q to quit.")
+                    again = read_key()
+                    if again in {"q", CTRL_C, CTRL_Q, ESC}:
+                        return 0
+                    state.status = f"uploaded to {state.remote_cwd}"
                     state.entries = list_entries(sftp, state.remote_cwd)
                 except SSHGetError as exc:
                     console.print(f"[red]error:[/red] {exc}")

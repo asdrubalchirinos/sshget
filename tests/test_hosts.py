@@ -1,9 +1,10 @@
 from pathlib import Path
 
+import paramiko
 import pytest
 
 from sshget.errors import SSHGetError
-from sshget.hosts import load_ssh_config, parse_target, resolve_host
+from sshget.hosts import load_ssh_config, parse_put_operands, parse_target, resolve_host
 
 
 @pytest.mark.parametrize(
@@ -78,3 +79,40 @@ Host bastion
     assert override.username == "alice"
     assert override.port == 44
     assert override.hostname == "10.0.0.5"
+
+
+def test_cli_identity_prepended(tmp_path: Path):
+    key = tmp_path / "server.pem"
+    key.write_text("not-a-real-key", encoding="utf-8")
+    resolved = resolve_host("example.com", paramiko.SSHConfig(), identity=str(key))
+    assert resolved.identity_files[0] == str(key)
+
+
+def test_cli_identity_missing(tmp_path: Path):
+    with pytest.raises(SSHGetError, match="identity file not found"):
+        resolve_host("example.com", paramiko.SSHConfig(), identity=str(tmp_path / "nope.pem"))
+
+
+@pytest.mark.parametrize(
+    ("operands", "host", "locals_", "interactive", "remote"),
+    [
+        (["myserver", "./a.txt"], "myserver", ["./a.txt"], True, None),
+        (["myserver", "./a.txt", "./b"], "myserver", ["./a.txt", "./b"], True, None),
+        (["./a.txt", "myserver:/tmp/"], "myserver", ["./a.txt"], False, "/tmp/"),
+        (["myserver:/var/www/", "./site"], "myserver", ["./site"], False, "/var/www/"),
+        (["./a.txt", "./b.txt", "user@host:/inbox/"], "host", ["./a.txt", "./b.txt"], False, "/inbox/"),
+    ],
+)
+def test_parse_put_operands(operands, host, locals_, interactive, remote):
+    target, paths, flag = parse_put_operands(operands)
+    assert target.host == host
+    assert paths == [Path(item) for item in locals_]
+    assert flag is interactive
+    assert target.remote_path == remote
+
+
+def test_parse_put_operands_needs_paths():
+    with pytest.raises(SSHGetError):
+        parse_put_operands(["myserver"])
+    with pytest.raises(SSHGetError):
+        parse_put_operands(["myserver:/tmp/"])

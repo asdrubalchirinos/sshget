@@ -141,7 +141,7 @@ def _connect_client(
     except AuthenticationException as exc:
         raise SSHGetError(
             f"Authentication failed for {host.username}@{host.hostname}:{host.port}. "
-            "sshget uses SSH keys only (ssh-agent and IdentityFile); password "
+            "SSH keys only (ssh-agent, IdentityFile, or -i); password "
             "login is not supported."
         ) from exc
     except SSHException as exc:
